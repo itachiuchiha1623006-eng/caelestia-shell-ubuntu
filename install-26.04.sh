@@ -20,6 +20,91 @@ err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 step()  { echo -e "\n${CYAN}${BOLD}== $* ==${NC}"; }
 die()   { err "$@"; exit 1; }
 
+install_m3shapes() {
+    local repo="$BUILD_DIR/m3shapes"
+    local commit="32ad9ce328bb77ed349b40a3be10ee9ea610b8ab"
+
+    step "Caelestia dependency: M3Shapes"
+    if [[ -d "$repo/.git" ]]; then
+        git -C "$repo" fetch --tags origin
+    else
+        git clone https://github.com/soramanew/m3shapes.git "$repo"
+    fi
+
+    git -C "$repo" checkout --detach "$commit"
+    cmake -S "$repo" -B "$repo/build" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/ \
+        -DCMAKE_CXX_COMPILER=g++ \
+        -DINSTALL_QMLDIR=usr/lib/qt6/qml
+    cmake --build "$repo/build" --parallel "$(nproc)"
+    sudo cmake --install "$repo/build"
+
+    [[ -f /usr/lib/qt6/qml/M3Shapes/qmldir ]] \
+        || die "M3Shapes installation did not create its QML module metadata"
+    ok "M3Shapes installed at the Caelestia-pinned revision"
+}
+
+apply_qt610_compat() {
+    local patch="$SCRIPT_DIR/patches/qt6.10-compat.patch"
+    local input="$SHELL_DIR/modules/lock/center/InputField.qml"
+    local elevation="$SHELL_DIR/components/controls/Elevation.qml"
+    local spinbox="$SHELL_DIR/components/controls/DoubleSpinBox.qml"
+
+    step "Qt 6.10 compatibility"
+    [[ -f "$patch" ]] || die "Missing compatibility patch: $patch"
+
+    if git -C "$SHELL_DIR" apply --check "$patch" 2>/dev/null; then
+        git -C "$SHELL_DIR" apply "$patch"
+        ok "Applied the complete Qt 6.10 compatibility patch"
+    elif git -C "$SHELL_DIR" apply --reverse --check "$patch" 2>/dev/null; then
+        ok "Qt 6.10 compatibility patch already applied"
+    else
+        warn "Patch context differs from this Caelestia revision; applying known fixes individually."
+
+        # Qt 6.10 reserves 'char' as a QML identifier.
+        if [[ -f "$input" ]] && grep -qw 'char' "$input"; then
+            sed -i 's/\bchar\b/charItem/g' "$input"
+            ok "Updated reserved QML identifier in InputField.qml"
+        fi
+
+        # Extract the compatibility shim from the patch's new-file hunk.
+        if [[ ! -f "$spinbox" ]]; then
+            awk '
+                /^\+\+\+ b\/components\/controls\/DoubleSpinBox.qml/ { found=1; next }
+                /^diff --git / && found { exit }
+                found && /^\+/ { print substr($0, 2) }
+            ' "$patch" > "$spinbox"
+            [[ -s "$spinbox" ]] || die "Could not extract DoubleSpinBox.qml from patch"
+            ok "Installed DoubleSpinBox Qt 6.10 compatibility shim"
+        fi
+
+        if [[ -f "$elevation" ]] && ! grep -q 'property real topLeftRadius' "$elevation"; then
+            python3 - "$elevation" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+s = p.read_text()
+anchor = "property real dp: [0, 1, 3, 6, 8, 12][level]"
+addition = """property real topLeftRadius: radius
+    property real topRightRadius: radius
+    property real bottomLeftRadius: radius
+    property real bottomRightRadius: radius"""
+if anchor not in s:
+    raise SystemExit(f"Expected insertion point not found in {p}; refusing to edit it.")
+s = s.replace(anchor, anchor + "\\n\\n    // Ubuntu 26.04 / Qt 6.10 compatibility\\n    " + addition, 1)
+p.write_text(s)
+PY
+            ok "Added Qt 6.10 per-corner radius compatibility properties"
+        fi
+
+        [[ -f "$spinbox" ]] || die "DoubleSpinBox.qml is missing after compatibility handling"
+        [[ -f "$input" ]] && grep -q 'charItem' "$input" \
+            || warn "InputField.qml may need a manual Qt 6.10 identifier review"
+        [[ -f "$elevation" ]] || warn "Elevation.qml was not found at the expected path; verify upstream layout."
+    fi
+}
+
 [[ "$(id -u)" -eq 0 ]] && die "Do not run this script as root."
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -189,7 +274,9 @@ sudo pip3 install dist/*.whl --break-system-packages --force-reinstall
 ok "Caelestia CLI installed"
 
 # ---------------------------------------------------------------- Step 7/8 --
-step "Step 7/8: Caelestia Shell (+ Qt 6.10 compatibility patch)"
+step "Step 7/8: Caelestia dependencies and Shell (+ Qt 6.10 compatibility)"
+
+install_m3shapes
 
 mkdir -p ~/.config/quickshell
 if [[ -d "$SHELL_DIR/.git" ]]; then
@@ -201,16 +288,9 @@ else
     cd "$SHELL_DIR"
 fi
 
-# Ubuntu 26.04 ships Qt 6.10.2; current Caelestia targets Qt 6.11.
-if git apply --check "$SCRIPT_DIR/patches/qt6.10-compat.patch" 2>/dev/null; then
-    git apply "$SCRIPT_DIR/patches/qt6.10-compat.patch"
-    ok "Applied Qt 6.10 compatibility patch"
-elif git apply --reverse --check "$SCRIPT_DIR/patches/qt6.10-compat.patch" 2>/dev/null; then
-    ok "Qt 6.10 compatibility patch already applied"
-else
-    warn "Patch did not apply cleanly against this Caelestia revision."
-    warn "Upstream has probably moved; see docs/ubuntu-26.04.md for what it fixes."
-fi
+# Ubuntu 26.04 ships Qt 6.10.2; apply compatibility fixes idempotently.
+apply_qt610_compat
+
 
 PKG_CONFIG_PATH="/usr/local/lib/x86_64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}" \
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/
@@ -256,6 +336,23 @@ systemctl --user daemon-reload 2>/dev/null || true
 systemctl --user enable caelestia-shell.service 2>/dev/null \
     && ok "Shell supervised by systemd (auto-restarts on crash)" \
     || warn "Could not enable caelestia-shell.service"
+
+# The laptop backlight node is root:video (0664). Give the installing user
+# access so Quickshell can adjust brightness without running as root.
+if getent group video >/dev/null 2>&1; then
+    if id -nG "$USER" | tr ' ' '\n' | grep -qx video; then
+        ok "User $USER already belongs to the video group"
+    else
+        sudo usermod -aG video "$USER"
+        warn "Added $USER to the video group. A complete logout/login is required."
+    fi
+else
+    warn "The video group does not exist; brightness permissions may need platform-specific setup."
+fi
+
+# Verify the key QML module metadata exists after installation.
+[[ -f /usr/lib/qt6/qml/M3Shapes/qmldir ]] \
+    || die "M3Shapes QML module is missing after installation."
 
 if Hyprland --verify-config 2>&1 | grep -q "config ok"; then
     ok "Hyprland config verified"
